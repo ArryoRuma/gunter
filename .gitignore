@@ -16,3 +16,4 @@ coverage/
 
 # Vite
 vite.config.ts.timestamp-*
+archived-reference/
