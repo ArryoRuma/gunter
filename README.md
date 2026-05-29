@@ -109,6 +109,32 @@ A creator can:
 - MVP: export/share project JSON
 - Next: minimal publish backend returning tokenized link
 
+## Current implementation status
+
+The `apps/web` app now includes an end-to-end MVP slice across all phases:
+
+- Phase 1: 2D parcel draw/edit, scale calibration, measurement overlays, no-overlap placement constraints.
+- Phase 2: Built-in asset library with field and complex assets.
+- Phase 3: Babylon.js 3D preview that mirrors parcel and placed assets.
+- Phase 4: Tour stop capture, reorder, and playback wiring into the 3D preview.
+- Phase 5: `project.json` export/import and local share-token generation stub.
+
+### Run locally
+
+```bash
+pnpm install
+pnpm dev
+```
+
+Other project commands:
+
+```bash
+pnpm lint
+pnpm typecheck
+pnpm build
+pnpm test
+```
+
 
 
 # Data Model — Entities & Fields

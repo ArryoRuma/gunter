@@ -1,0 +1,184 @@
+.app-shell {
+  min-height: 100dvh;
+  padding: 1rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.app-header {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.project-title {
+  font-size: 1.25rem;
+  padding: 0.5rem 0.625rem;
+  border-radius: 0.5rem;
+  border: 1px solid #cbd5e0;
+  background: #ffffff;
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.tabs button,
+.button-row button,
+.asset-action-row button,
+.tour-row button {
+  border: 1px solid #2d3748;
+  background: #1a202c;
+  color: #f7fafc;
+  border-radius: 0.5rem;
+  padding: 0.45rem 0.75rem;
+  cursor: pointer;
+}
+
+button[data-active='true'] {
+  background: #2b6cb0;
+}
+
+.layout {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(260px, 300px) 1fr;
+}
+
+.panel,
+.phase-panel {
+  border: 1px solid #e2e8f0;
+  border-radius: 0.75rem;
+  background: #ffffff;
+  padding: 1rem;
+}
+
+.control-group {
+  margin-top: 1rem;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.control-group input,
+.control-group select,
+.phase-panel select {
+  padding: 0.45rem 0.625rem;
+  border-radius: 0.5rem;
+  border: 1px solid #cbd5e0;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.canvas-wrap {
+  border: 1px solid #e2e8f0;
+  border-radius: 0.75rem;
+  background: #ffffff;
+  padding: 0.75rem;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.editor-canvas {
+  width: 100%;
+  border-radius: 0.5rem;
+  border: 1px solid #cbd5e0;
+  touch-action: none;
+}
+
+.canvas-bg {
+  fill: #f7fafc;
+}
+
+.parcel-outline {
+  fill: none;
+  stroke: #2d3748;
+  stroke-width: 2;
+}
+
+.parcel-fill {
+  fill: rgba(66, 153, 225, 0.12);
+  stroke: #2b6cb0;
+  stroke-width: 2;
+}
+
+.vertex {
+  fill: #2d3748;
+  cursor: grab;
+}
+
+.measure-label-bg {
+  fill: rgba(255, 255, 255, 0.85);
+  rx: 4;
+  ry: 4;
+}
+
+.measure-label,
+.asset-label,
+.asset-measure {
+  fill: #1a202c;
+  text-anchor: middle;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.asset-shape {
+  opacity: 0.85;
+  cursor: pointer;
+}
+
+.calibration-point {
+  fill: #d69e2e;
+}
+
+.calibration-line {
+  stroke: #d69e2e;
+  stroke-width: 3;
+  stroke-dasharray: 8 6;
+}
+
+.asset-actions,
+.tour-list {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.asset-action-row,
+.tour-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.status {
+  margin-top: 1rem;
+  color: #2d3748;
+}
+
+.preview-canvas {
+  width: 100%;
+  height: 500px;
+  border: 1px solid #cbd5e0;
+  border-radius: 0.5rem;
+}
+
+.file-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.file-label input {
+  width: 220px;
+}
+
+@media (max-width: 1024px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+}
