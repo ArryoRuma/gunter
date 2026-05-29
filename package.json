@@ -4,11 +4,12 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "typecheck": "tsc --noEmit",
-    "preview": "vite preview"
+    "dev": "pnpm -C apps/web dev",
+    "build": "pnpm -C apps/web build",
+    "lint": "pnpm -C apps/web lint",
+    "typecheck": "pnpm -C apps/web exec tsc --noEmit",
+    "preview": "pnpm -C apps/web preview",
+    "test": "pnpm -C apps/web test"
   },
   "dependencies": {
     "@babylonjs/core": "^7.0.0",

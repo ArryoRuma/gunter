@@ -5,6 +5,8 @@ export type EditorMode =
   | 'place-asset'
   | 'move-asset'
 
+export type TabId = 'plan' | 'preview' | 'tour' | 'share'
+
 export interface Point {
   x: number
   y: number
@@ -62,4 +64,10 @@ export interface ProjectDocument {
   assets: PlacedAsset[]
   calibration: ScaleCalibration | null
   tourStops: TourStop[]
+}
+
+export interface PlanSnapshot {
+  parcelPoints: Point[]
+  assets: PlacedAsset[]
+  calibration: ScaleCalibration | null
 }

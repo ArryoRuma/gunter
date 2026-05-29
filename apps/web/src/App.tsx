@@ -1,38 +1,74 @@
-import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useState } from 'react'
+import {
+  useCallback,
+  type ChangeEvent,
+  type PointerEvent as ReactPointerEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { BabylonPreview } from './BabylonPreview'
+import { ASSET_TYPES, getAssetType } from './assets'
+import { useEditorStore } from './editorStore'
 import {
   distance,
   getAssetCorners,
   isAssetInsideParcel,
+  isPointInPolygon,
   midpoint,
-  overlapsAnyAsset,
+  polygonsOverlap,
 } from './geometry'
 import './App.css'
 import type {
-  AssetType,
-  EditorMode,
+  PlanSnapshot,
   PlacedAsset,
   Point,
   ProjectDocument,
   ScaleCalibration,
+  TabId,
   TourStop,
 } from './types'
-
-type TabId = 'plan' | 'preview' | 'tour' | 'share'
 
 const STORAGE_KEY = 'gunter-project-v1'
 const CANVAS_WIDTH = 1000
 const CANVAS_HEIGHT = 640
 const DEFAULT_FEET_PER_WORLD_UNIT = 1
 
-const ASSET_TYPES: AssetType[] = [
-  { id: 'field-180', name: "Field 180'", widthFt: 180, heightFt: 180, color: '#3182ce' },
-  { id: 'field-220', name: "Field 220'", widthFt: 220, heightFt: 220, color: '#2b6cb0' },
-  { id: 'concessions', name: 'Concessions', widthFt: 56, heightFt: 40, color: '#dd6b20' },
-  { id: 'parking', name: 'Parking Module', widthFt: 120, heightFt: 80, color: '#4a5568' },
-  { id: 'batting-cages', name: 'Batting Cages', widthFt: 90, heightFt: 32, color: '#805ad5' },
-  { id: 'lighting', name: 'Lighting Cluster', widthFt: 24, heightFt: 24, color: '#d69e2e' },
-]
+type Conflict =
+  | {
+      id: string
+      type: 'outside-parcel'
+      assetId: string
+      message: string
+    }
+  | {
+      id: string
+      type: 'overlap'
+      assetIds: [string, string]
+      message: string
+    }
+
+type AssetDragSession = {
+  startPoint: Point
+  beforeAssets: PlacedAsset[]
+  assetIds: string[]
+}
+
+type ParcelDragSession = {
+  vertexIndex: number
+  beforeParcel: Point[]
+}
+
+type RotateSession = {
+  assetId: string
+  center: Point
+  initialPointerAngle: number
+  beforeAssets: PlacedAsset[]
+}
+
+type MarqueeSession = {
+  startPoint: Point
+}
 
 function parseStoredProject(raw: string): ProjectDocument | null {
   const parsed = JSON.parse(raw) as ProjectDocument
@@ -69,43 +105,206 @@ function formatFeet(value: number): string {
   return `${value.toFixed(1)} ft`
 }
 
+function toCanvasPoint(clientX: number, clientY: number, rect: DOMRect): Point {
+  return {
+    x: ((clientX - rect.left) / rect.width) * CANVAS_WIDTH,
+    y: ((clientY - rect.top) / rect.height) * CANVAS_HEIGHT,
+  }
+}
+
 function getSvgPoint(event: ReactPointerEvent<SVGSVGElement>): Point {
-  const rect = event.currentTarget.getBoundingClientRect()
-  const x = ((event.clientX - rect.left) / rect.width) * CANVAS_WIDTH
-  const y = ((event.clientY - rect.top) / rect.height) * CANVAS_HEIGHT
-  return { x, y }
+  return toCanvasPoint(event.clientX, event.clientY, event.currentTarget.getBoundingClientRect())
+}
+
+function getSvgPointFromCircle(event: ReactPointerEvent<SVGCircleElement>): Point | null {
+  const svg = event.currentTarget.ownerSVGElement
+  if (!svg) {
+    return null
+  }
+  return toCanvasPoint(event.clientX, event.clientY, svg.getBoundingClientRect())
 }
 
 function sortTourStops(stops: TourStop[]): TourStop[] {
   return [...stops].sort((a, b) => a.orderIndex - b.orderIndex)
 }
 
+function pointInRect(point: Point, rect: { minX: number; minY: number; maxX: number; maxY: number }): boolean {
+  return point.x >= rect.minX && point.x <= rect.maxX && point.y >= rect.minY && point.y <= rect.maxY
+}
+
+function getNormalizedRect(first: Point, second: Point): {
+  minX: number
+  minY: number
+  maxX: number
+  maxY: number
+} {
+  return {
+    minX: Math.min(first.x, second.x),
+    minY: Math.min(first.y, second.y),
+    maxX: Math.max(first.x, second.x),
+    maxY: Math.max(first.y, second.y),
+  }
+}
+
+function normalizeDegrees(value: number): number {
+  const normalized = value % 360
+  return normalized < 0 ? normalized + 360 : normalized
+}
+
+function snapValue(value: number, gridSize: number): number {
+  if (gridSize <= 0) {
+    return value
+  }
+  return Math.round(value / gridSize) * gridSize
+}
+
+function snapPoint(point: Point, gridSize: number): Point {
+  return {
+    x: snapValue(point.x, gridSize),
+    y: snapValue(point.y, gridSize),
+  }
+}
+
+function rotatePointAround(point: Point, center: Point, radians: number): Point {
+  const dx = point.x - center.x
+  const dy = point.y - center.y
+  const cosAngle = Math.cos(radians)
+  const sinAngle = Math.sin(radians)
+  return {
+    x: center.x + dx * cosAngle - dy * sinAngle,
+    y: center.y + dx * sinAngle + dy * cosAngle,
+  }
+}
+
+function selectionCenter(selectedAssets: PlacedAsset[]): Point {
+  if (selectedAssets.length === 0) {
+    return { x: 0, y: 0 }
+  }
+  const sum = selectedAssets.reduce(
+    (accumulator, asset) => ({ x: accumulator.x + asset.x, y: accumulator.y + asset.y }),
+    { x: 0, y: 0 },
+  )
+  return {
+    x: sum.x / selectedAssets.length,
+    y: sum.y / selectedAssets.length,
+  }
+}
+
+function assetsEqual(first: PlacedAsset[], second: PlacedAsset[]): boolean {
+  if (first.length !== second.length) {
+    return false
+  }
+  for (let index = 0; index < first.length; index += 1) {
+    const left = first[index]
+    const right = second[index]
+    if (
+      left.id !== right.id ||
+      left.x !== right.x ||
+      left.y !== right.y ||
+      left.rotationDeg !== right.rotationDeg ||
+      left.width !== right.width ||
+      left.height !== right.height ||
+      left.typeId !== right.typeId
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
+function createConflicts(assets: PlacedAsset[], parcelPoints: Point[]): Conflict[] {
+  const conflicts: Conflict[] = []
+  const parcelClosed = parcelPoints.length >= 3
+  if (parcelClosed) {
+    for (const asset of assets) {
+      if (!isAssetInsideParcel(asset, parcelPoints)) {
+        conflicts.push({
+          id: `outside-${asset.id}`,
+          type: 'outside-parcel',
+          assetId: asset.id,
+          message: `${getAssetType(asset.typeId).name} is outside parcel bounds.`,
+        })
+      }
+    }
+  }
+  for (let firstIndex = 0; firstIndex < assets.length; firstIndex += 1) {
+    for (let secondIndex = firstIndex + 1; secondIndex < assets.length; secondIndex += 1) {
+      const firstAsset = assets[firstIndex]
+      const secondAsset = assets[secondIndex]
+      const overlaps = polygonsOverlap(getAssetCorners(firstAsset), getAssetCorners(secondAsset))
+      if (overlaps) {
+        conflicts.push({
+          id: `overlap-${firstAsset.id}-${secondAsset.id}`,
+          type: 'overlap',
+          assetIds: [firstAsset.id, secondAsset.id],
+          message: `${getAssetType(firstAsset.typeId).name} overlaps ${getAssetType(secondAsset.typeId).name}.`,
+        })
+      }
+    }
+  }
+  return conflicts
+}
+
 function App() {
-  const [initialProject] = useState<ProjectDocument | null>(() => loadInitialProject())
-  const [activeTab, setActiveTab] = useState<TabId>('plan')
-  const [mode, setMode] = useState<EditorMode>('draw-parcel')
-  const [parcelPoints, setParcelPoints] = useState<Point[]>(initialProject?.parcelPoints ?? [])
-  const [assets, setAssets] = useState<PlacedAsset[]>(initialProject?.assets ?? [])
-  const [selectedAssetTypeId, setSelectedAssetTypeId] = useState<string>(ASSET_TYPES[0].id)
-  const [calibration, setCalibration] = useState<ScaleCalibration | null>(initialProject?.calibration ?? null)
-  const [calibrationDraft, setCalibrationDraft] = useState<Point[]>([])
-  const [calibrationFeetInput, setCalibrationFeetInput] = useState<string>('180')
-  const [draggingVertexIndex, setDraggingVertexIndex] = useState<number | null>(null)
-  const [draggingAssetId, setDraggingAssetId] = useState<string | null>(null)
-  const [status, setStatus] = useState<string>(
-    initialProject
-      ? 'Project restored from local storage.'
-      : 'Draw a parcel by clicking points on the canvas.',
-  )
-  const [tourStops, setTourStops] = useState<TourStop[]>(
-    initialProject ? sortTourStops(initialProject.tourStops) : [],
-  )
-  const [activeTourStopId, setActiveTourStopId] = useState<string | null>(null)
-  const [environmentPreset, setEnvironmentPreset] = useState<'day' | 'dusk'>('day')
-  const [shareToken, setShareToken] = useState<string>('')
-  const [projectTitle, setProjectTitle] = useState<string>(
-    initialProject?.title ?? 'Baseball Complex Plan',
-  )
+  const {
+    activeTab,
+    mode,
+    projectTitle,
+    parcelPoints,
+    assets,
+    selectedAssetTypeId,
+    selectedAssetIds,
+    calibration,
+    calibrationDraft,
+    calibrationFeetInput,
+    status,
+    tourStops,
+    activeTourStopId,
+    environmentPreset,
+    shareToken,
+    undoStack,
+    redoStack,
+    setActiveTab,
+    setMode,
+    setProjectTitle,
+    setParcelPoints,
+    setAssets,
+    setSelectedAssetTypeId,
+    setSelectedAssetIds,
+    setCalibrationDraft,
+    setCalibrationFeetInput,
+    setStatus,
+    setTourStops,
+    setActiveTourStopId,
+    setEnvironmentPreset,
+    setShareToken,
+    initializeFromProject,
+    commitPlanTransition,
+    undo,
+    redo,
+  } = useEditorStore()
+
+  const bootstrappedRef = useRef(false)
+  const parcelDragSessionRef = useRef<ParcelDragSession | null>(null)
+  const assetDragSessionRef = useRef<AssetDragSession | null>(null)
+  const rotateSessionRef = useRef<RotateSession | null>(null)
+  const marqueeSessionRef = useRef<MarqueeSession | null>(null)
+  const [snapToGrid, setSnapToGrid] = useState(false)
+  const [gridSize, setGridSize] = useState(16)
+  const [marqueeRect, setMarqueeRect] = useState<{
+    minX: number
+    minY: number
+    maxX: number
+    maxY: number
+  } | null>(null)
+
+  useEffect(() => {
+    if (bootstrappedRef.current) {
+      return
+    }
+    initializeFromProject(loadInitialProject())
+    bootstrappedRef.current = true
+  }, [initializeFromProject])
 
   useEffect(() => {
     const document: ProjectDocument = {
@@ -120,14 +319,36 @@ function App() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(document))
   }, [assets, calibration, parcelPoints, projectTitle, tourStops])
 
+  const selectedAssets = useMemo(
+    () => assets.filter((asset) => selectedAssetIds.includes(asset.id)),
+    [assets, selectedAssetIds],
+  )
+
+  const selectedAssetSet = useMemo(() => new Set(selectedAssetIds), [selectedAssetIds])
+  const conflicts = useMemo(() => createConflicts(assets, parcelPoints), [assets, parcelPoints])
+  const previewReady = conflicts.length === 0
+  const parcelClosed = parcelPoints.length >= 3
+
+  const planSnapshot = useMemo<PlanSnapshot>(
+    () => ({ parcelPoints, assets, calibration }),
+    [assets, calibration, parcelPoints],
+  )
+
+  const commitPlan = useCallback((
+    description: string,
+    next: PlanSnapshot,
+    statusMessage?: string,
+    previousSnapshot = planSnapshot,
+  ): void => {
+    commitPlanTransition(description, previousSnapshot, next, statusMessage)
+  }, [commitPlanTransition, planSnapshot])
+
   const feetPerUnit = useMemo(() => feetPerWorldUnit(calibration), [calibration])
   const selectedAssetType = useMemo(
     () => ASSET_TYPES.find((assetType) => assetType.id === selectedAssetTypeId) ?? ASSET_TYPES[0],
     [selectedAssetTypeId],
   )
 
-  const parcelClosed = parcelPoints.length >= 3
-  const canPlaceAssets = parcelClosed
   const sortedTourStops = useMemo(() => sortTourStops(tourStops), [tourStops])
   const activeTourStop = useMemo(
     () => sortedTourStops.find((stop) => stop.id === activeTourStopId) ?? null,
@@ -165,80 +386,359 @@ function App() {
     }
   }
 
-  const isValidAssetPlacement = (candidate: PlacedAsset): boolean => {
-    if (!parcelClosed) {
-      return false
+  const setTabWithReadinessCheck = (tabId: TabId): void => {
+    if ((tabId === 'preview' || tabId === 'share') && !previewReady) {
+      setStatus('Resolve parcel conflicts before opening preview or export tools.')
+      return
     }
-    if (!isAssetInsideParcel(candidate, parcelPoints)) {
-      return false
-    }
-    return !overlapsAnyAsset(candidate, assets)
+    setActiveTab(tabId)
   }
+
+  const setSelectionFromPointer = (assetId: string, additive: boolean): string[] => {
+    if (!additive) {
+      setSelectedAssetIds([assetId])
+      return [assetId]
+    }
+    const selected = selectedAssetIds.includes(assetId)
+    const nextSelection = selected
+      ? selectedAssetIds.filter((id) => id !== assetId)
+      : [...selectedAssetIds, assetId]
+    setSelectedAssetIds(nextSelection)
+    return nextSelection
+  }
+
+  const commitRotateSelection = useCallback((deltaDegrees: number, precise = false): void => {
+    if (selectedAssetIds.length === 0) {
+      setStatus('Select at least one asset to rotate.')
+      return
+    }
+    const center = selectionCenter(selectedAssets)
+    const radians = (deltaDegrees * Math.PI) / 180
+    const nextAssets = assets.map((asset) => {
+      if (!selectedAssetIds.includes(asset.id)) {
+        return asset
+      }
+      const nextPoint = rotatePointAround({ x: asset.x, y: asset.y }, center, radians)
+      return {
+        ...asset,
+        x: nextPoint.x,
+        y: nextPoint.y,
+        rotationDeg: normalizeDegrees(asset.rotationDeg + deltaDegrees),
+      }
+    })
+    commitPlan(
+      precise ? 'Fine rotate selected assets' : 'Rotate selected assets',
+      {
+        ...planSnapshot,
+        assets: nextAssets,
+      },
+      `Rotated ${selectedAssetIds.length} asset(s).`,
+    )
+  }, [assets, commitPlan, planSnapshot, selectedAssetIds, selectedAssets, setStatus])
+
+  const commitDeleteSelection = useCallback((): void => {
+    if (selectedAssetIds.length === 0) {
+      setStatus('Select assets before deleting.')
+      return
+    }
+    const nextAssets = assets.filter((asset) => !selectedAssetIds.includes(asset.id))
+    commitPlan(
+      selectedAssetIds.length === 1 ? 'Delete asset' : 'Delete selected assets',
+      {
+        ...planSnapshot,
+        assets: nextAssets,
+      },
+      `Deleted ${selectedAssetIds.length} asset(s).`,
+    )
+    setSelectedAssetIds([])
+  }, [assets, commitPlan, planSnapshot, selectedAssetIds, setSelectedAssetIds, setStatus])
+
+  const commitDuplicateSelection = useCallback((): void => {
+    if (selectedAssetIds.length === 0) {
+      setStatus('Select assets before duplicating.')
+      return
+    }
+    const selected = assets.filter((asset) => selectedAssetIds.includes(asset.id))
+    const duplicates = selected.map((asset) => ({
+      ...asset,
+      id: crypto.randomUUID(),
+      x: asset.x + 24,
+      y: asset.y + 24,
+    }))
+    const nextAssets = [...assets, ...duplicates]
+    commitPlan(
+      selectedAssetIds.length === 1 ? 'Duplicate asset' : 'Duplicate selected assets',
+      {
+        ...planSnapshot,
+        assets: nextAssets,
+      },
+      `Duplicated ${selectedAssetIds.length} asset(s).`,
+    )
+    setSelectedAssetIds(duplicates.map((asset) => asset.id))
+  }, [assets, commitPlan, planSnapshot, selectedAssetIds, setSelectedAssetIds, setStatus])
+
+  const commitNudgeSelection = useCallback((deltaX: number, deltaY: number): void => {
+    if (selectedAssetIds.length === 0) {
+      return
+    }
+    const selectedIdSet = new Set(selectedAssetIds)
+    const nextAssets = assets.map((asset) =>
+      selectedIdSet.has(asset.id)
+        ? {
+            ...asset,
+            x: snapToGrid ? snapValue(asset.x + deltaX, gridSize) : asset.x + deltaX,
+            y: snapToGrid ? snapValue(asset.y + deltaY, gridSize) : asset.y + deltaY,
+          }
+        : asset,
+    )
+    commitPlan(
+      selectedAssetIds.length === 1 ? 'Nudge asset' : 'Nudge selected assets',
+      {
+        ...planSnapshot,
+        assets: nextAssets,
+      },
+      `Nudged ${selectedAssetIds.length} asset(s).`,
+    )
+  }, [assets, commitPlan, gridSize, planSnapshot, selectedAssetIds, snapToGrid])
+
+  const onFocusConflict = useCallback((conflict: Conflict): void => {
+    if (conflict.type === 'outside-parcel') {
+      setSelectedAssetIds([conflict.assetId])
+      setMode('move-asset')
+      setStatus('Selected outside asset. Move it back inside parcel bounds.')
+      return
+    }
+    setSelectedAssetIds(conflict.assetIds)
+    setMode('move-asset')
+    setStatus('Selected overlapping assets. Move one to resolve overlap.')
+  }, [setMode, setSelectedAssetIds, setStatus])
 
   const onCanvasPointerDown = (event: ReactPointerEvent<SVGSVGElement>): void => {
     const point = getSvgPoint(event)
+
     if (mode === 'draw-parcel') {
       if (parcelPoints.length >= 3 && distance(parcelPoints[0], point) <= 10) {
         setStatus('Parcel closed. Switch modes to calibrate scale or place assets.')
         return
       }
-      setParcelPoints((previous) => [...previous, point])
-      setStatus('Point added to parcel.')
+      commitPlan(
+        parcelPoints.length === 0 ? 'Start parcel' : 'Add parcel vertex',
+        {
+          ...planSnapshot,
+          parcelPoints: [...parcelPoints, point],
+        },
+        'Point added to parcel.',
+      )
       return
     }
+
     if (mode === 'calibrate-scale') {
-      setCalibrationDraft((previous) => {
-        const next = previous.length >= 2 ? [point] : [...previous, point]
-        setStatus(
-          next.length === 2
-            ? 'Enter real-world length and apply calibration.'
-            : 'Calibration point 1 set. Click point 2.',
-        )
-        return next
-      })
+      const nextDraft = calibrationDraft.length >= 2 ? [point] : [...calibrationDraft, point]
+      setCalibrationDraft(nextDraft)
+      setStatus(
+        nextDraft.length === 2
+          ? 'Enter real-world length and apply calibration.'
+          : 'Calibration point 1 set. Click point 2.',
+      )
       return
     }
+
+    if (mode === 'edit-parcel') {
+      for (let index = 0; index < parcelPoints.length; index += 1) {
+        if (distance(parcelPoints[index], point) <= 10) {
+          parcelDragSessionRef.current = {
+            vertexIndex: index,
+            beforeParcel: parcelPoints,
+          }
+          return
+        }
+      }
+      return
+    }
+
     if (mode === 'place-asset') {
-      if (!canPlaceAssets) {
+      if (!parcelClosed) {
         setStatus('Close the parcel before placing assets.')
         return
       }
-      const candidate = createAssetFromPoint(point)
-      if (!isValidAssetPlacement(candidate)) {
-        setStatus('Placement blocked: asset must stay inside parcel and avoid overlap.')
+      const placementPoint = snapToGrid ? snapPoint(point, gridSize) : point
+      const candidate = createAssetFromPoint(placementPoint)
+      commitPlan(
+        'Place asset',
+        {
+          ...planSnapshot,
+          assets: [...assets, candidate],
+        },
+        `${selectedAssetType.name} placed.`,
+      )
+      setSelectedAssetIds([candidate.id])
+      return
+    }
+
+    if (mode === 'move-asset') {
+      const clickedAsset = [...assets].reverse().find((asset) => {
+        const corners = getAssetCorners(asset)
+        return isPointInPolygon(point, corners)
+      })
+      if (!clickedAsset) {
+        marqueeSessionRef.current = {
+          startPoint: point,
+        }
+        setMarqueeRect(getNormalizedRect(point, point))
+        setSelectedAssetIds([])
         return
       }
-      setAssets((previous) => [...previous, candidate])
-      setStatus(`${selectedAssetType.name} placed.`)
+      const nextSelection = setSelectionFromPointer(clickedAsset.id, event.shiftKey)
+      assetDragSessionRef.current = {
+        startPoint: point,
+        beforeAssets: assets,
+        assetIds: nextSelection.includes(clickedAsset.id) ? nextSelection : [clickedAsset.id],
+      }
+    }
+  }
+
+  const onRotateHandlePointerDown = (
+    event: ReactPointerEvent<SVGCircleElement>,
+    asset: PlacedAsset,
+  ): void => {
+    event.stopPropagation()
+    setSelectedAssetIds([asset.id])
+    const pointer = getSvgPointFromCircle(event)
+    if (!pointer) {
+      return
+    }
+    rotateSessionRef.current = {
+      assetId: asset.id,
+      center: { x: asset.x, y: asset.y },
+      initialPointerAngle: Math.atan2(pointer.y - asset.y, pointer.x - asset.x),
+      beforeAssets: assets,
     }
   }
 
   const onCanvasPointerMove = (event: ReactPointerEvent<SVGSVGElement>): void => {
     const point = getSvgPoint(event)
-    if (draggingVertexIndex !== null) {
-      setParcelPoints((previous) => {
-        const next = [...previous]
-        next[draggingVertexIndex] = point
-        return next
-      })
+
+    if (parcelDragSessionRef.current) {
+      const session = parcelDragSessionRef.current
+      const nextParcel = [...parcelPoints]
+      nextParcel[session.vertexIndex] = point
+      setParcelPoints(nextParcel)
       return
     }
-    if (draggingAssetId !== null) {
-      setAssets((previous) =>
-        previous.map((asset) => {
-          if (asset.id !== draggingAssetId) {
-            return asset
-          }
-          const candidate = { ...asset, x: point.x, y: point.y }
-          return isValidAssetPlacement(candidate) ? candidate : asset
-        }),
+
+    if (assetDragSessionRef.current) {
+      const session = assetDragSessionRef.current
+      const deltaX = point.x - session.startPoint.x
+      const deltaY = point.y - session.startPoint.y
+      const draggedIds = new Set(session.assetIds)
+      const movedAssets = session.beforeAssets.map((asset) =>
+        draggedIds.has(asset.id)
+          ? {
+              ...asset,
+              x: snapToGrid ? snapValue(asset.x + deltaX, gridSize) : asset.x + deltaX,
+              y: snapToGrid ? snapValue(asset.y + deltaY, gridSize) : asset.y + deltaY,
+            }
+          : asset,
       )
+      setAssets(movedAssets)
+      return
+    }
+
+    if (marqueeSessionRef.current) {
+      const rect = getNormalizedRect(marqueeSessionRef.current.startPoint, point)
+      setMarqueeRect(rect)
+      const selection = assets
+        .filter((asset) => {
+          const center = { x: asset.x, y: asset.y }
+          if (pointInRect(center, rect)) {
+            return true
+          }
+          const corners = getAssetCorners(asset)
+          return corners.some((corner) => pointInRect(corner, rect))
+        })
+        .map((asset) => asset.id)
+      setSelectedAssetIds(selection)
+      return
+    }
+
+    if (rotateSessionRef.current) {
+      const session = rotateSessionRef.current
+      const angle = Math.atan2(point.y - session.center.y, point.x - session.center.x)
+      const deltaDegreesRaw = ((angle - session.initialPointerAngle) * 180) / Math.PI
+      const deltaDegrees = event.shiftKey ? Math.round(deltaDegreesRaw / 15) * 15 : deltaDegreesRaw
+      const nextAssets = session.beforeAssets.map((asset) =>
+        asset.id === session.assetId
+          ? {
+              ...asset,
+              rotationDeg: normalizeDegrees(asset.rotationDeg + deltaDegrees),
+            }
+          : asset,
+      )
+      setAssets(nextAssets)
     }
   }
 
   const onCanvasPointerUp = (): void => {
-    setDraggingVertexIndex(null)
-    setDraggingAssetId(null)
+    if (parcelDragSessionRef.current) {
+      const session = parcelDragSessionRef.current
+      const previousSnapshot: PlanSnapshot = {
+        ...planSnapshot,
+        parcelPoints: session.beforeParcel,
+      }
+      const nextSnapshot: PlanSnapshot = {
+        ...planSnapshot,
+        parcelPoints,
+      }
+      if (session.beforeParcel !== parcelPoints) {
+        commitPlan('Move parcel vertex', nextSnapshot, 'Parcel vertex moved.', previousSnapshot)
+      }
+      parcelDragSessionRef.current = null
+      return
+    }
+
+    if (assetDragSessionRef.current) {
+      const session = assetDragSessionRef.current
+      const previousSnapshot: PlanSnapshot = {
+        ...planSnapshot,
+        assets: session.beforeAssets,
+      }
+      const nextSnapshot: PlanSnapshot = {
+        ...planSnapshot,
+        assets,
+      }
+      if (!assetsEqual(session.beforeAssets, assets)) {
+        commitPlan(
+          session.assetIds.length === 1 ? 'Move asset' : 'Move selected assets',
+          nextSnapshot,
+          `Moved ${session.assetIds.length} asset(s).`,
+          previousSnapshot,
+        )
+      }
+      assetDragSessionRef.current = null
+      return
+    }
+
+    if (marqueeSessionRef.current) {
+      marqueeSessionRef.current = null
+      setMarqueeRect(null)
+      return
+    }
+
+    if (rotateSessionRef.current) {
+      const session = rotateSessionRef.current
+      const previousSnapshot: PlanSnapshot = {
+        ...planSnapshot,
+        assets: session.beforeAssets,
+      }
+      const nextSnapshot: PlanSnapshot = {
+        ...planSnapshot,
+        assets,
+      }
+      if (!assetsEqual(session.beforeAssets, assets)) {
+        commitPlan('Rotate asset handle', nextSnapshot, 'Asset rotated.', previousSnapshot)
+      }
+      rotateSessionRef.current = null
+    }
   }
 
   const onApplyCalibration = (): void => {
@@ -247,24 +747,36 @@ function App() {
       setStatus('Calibration requires two points and a positive real-world length.')
       return
     }
-    setCalibration({
+    const nextCalibration = {
       firstPoint: calibrationDraft[0],
       secondPoint: calibrationDraft[1],
       realWorldFeet: feet,
-    })
-    setStatus(`Calibration applied: ${formatFeet(feet)} for selected line.`)
+    }
+    commitPlan(
+      'Apply calibration',
+      {
+        ...planSnapshot,
+        calibration: nextCalibration,
+      },
+      `Calibration applied: ${formatFeet(feet)} for selected line.`,
+    )
+    setCalibrationDraft([])
   }
 
-  const onRotateAsset = (assetId: string, deltaDegrees: number): void => {
-    setAssets((previous) =>
-      previous.map((asset) => {
-        if (asset.id !== assetId) {
-          return asset
-        }
-        const candidate = { ...asset, rotationDeg: asset.rotationDeg + deltaDegrees }
-        return isValidAssetPlacement(candidate) ? candidate : asset
-      }),
+  const onResetCalibration = (): void => {
+    if (!calibration) {
+      setStatus('No calibration to clear.')
+      return
+    }
+    commitPlan(
+      'Reset calibration',
+      {
+        ...planSnapshot,
+        calibration: null,
+      },
+      'Calibration cleared.',
     )
+    setCalibrationDraft([])
   }
 
   const onCreateTourStop = (): void => {
@@ -282,23 +794,21 @@ function App() {
         target: { x: focus.x, y: 0, z: focus.y },
       },
     }
-    setTourStops((previous) => [...previous, stop])
+    setTourStops([...tourStops, stop])
     setActiveTourStopId(stop.id)
     setStatus('Tour stop captured.')
   }
 
   const onMoveTourStop = (id: string, direction: -1 | 1): void => {
-    setTourStops((previous) => {
-      const ordered = sortTourStops(previous)
-      const index = ordered.findIndex((stop) => stop.id === id)
-      const targetIndex = index + direction
-      if (index < 0 || targetIndex < 0 || targetIndex >= ordered.length) {
-        return previous
-      }
-      const swapped = [...ordered]
-      ;[swapped[index], swapped[targetIndex]] = [swapped[targetIndex], swapped[index]]
-      return swapped.map((stop, itemIndex) => ({ ...stop, orderIndex: itemIndex }))
-    })
+    const ordered = sortTourStops(tourStops)
+    const index = ordered.findIndex((stop) => stop.id === id)
+    const targetIndex = index + direction
+    if (index < 0 || targetIndex < 0 || targetIndex >= ordered.length) {
+      return
+    }
+    const swapped = [...ordered]
+    ;[swapped[index], swapped[targetIndex]] = [swapped[targetIndex], swapped[index]]
+    setTourStops(swapped.map((stop, itemIndex) => ({ ...stop, orderIndex: itemIndex })))
   }
 
   const onPlayTour = (): void => {
@@ -319,6 +829,10 @@ function App() {
   }
 
   const onExportProject = (): void => {
+    if (!previewReady) {
+      setStatus('Resolve conflicts before exporting project JSON.')
+      return
+    }
     const project: ProjectDocument = {
       version: 1,
       title: projectTitle,
@@ -337,7 +851,7 @@ function App() {
     setStatus('Project JSON exported.')
   }
 
-  const onImportProject = async (event: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
+  const onImportProject = async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
     const file = event.target.files?.[0]
     if (!file) {
       return
@@ -348,51 +862,142 @@ function App() {
       setStatus('Import failed: invalid project JSON.')
       return
     }
-    setProjectTitle(imported.title)
-    setParcelPoints(imported.parcelPoints)
-    setAssets(imported.assets)
-    setCalibration(imported.calibration)
-    setTourStops(sortTourStops(imported.tourStops))
-    setActiveTourStopId(null)
+    initializeFromProject(imported)
     setStatus('Project imported successfully.')
   }
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      const target = event.target as HTMLElement | null
+      if (
+        target?.tagName === 'INPUT' ||
+        target?.tagName === 'TEXTAREA' ||
+        target?.tagName === 'SELECT' ||
+        target?.isContentEditable
+      ) {
+        return
+      }
+
+      const modifier = event.metaKey || event.ctrlKey
+
+      if (modifier && event.key.toLowerCase() === 'z') {
+        event.preventDefault()
+        if (event.shiftKey) {
+          redo()
+        } else {
+          undo()
+        }
+        return
+      }
+
+      if (modifier && event.key.toLowerCase() === 'd') {
+        event.preventDefault()
+        commitDuplicateSelection()
+        return
+      }
+
+      if (event.key === 'Delete' || event.key === 'Backspace') {
+        event.preventDefault()
+        commitDeleteSelection()
+        return
+      }
+
+      if (event.altKey && event.key === 'ArrowLeft') {
+        event.preventDefault()
+        commitRotateSelection(-1, true)
+        return
+      }
+
+      if (event.altKey && event.key === 'ArrowRight') {
+        event.preventDefault()
+        commitRotateSelection(1, true)
+        return
+      }
+
+      if (!event.altKey && event.key.startsWith('Arrow')) {
+        event.preventDefault()
+        const step = event.shiftKey ? 10 : 2
+        if (event.key === 'ArrowLeft') {
+          commitNudgeSelection(-step, 0)
+          return
+        }
+        if (event.key === 'ArrowRight') {
+          commitNudgeSelection(step, 0)
+          return
+        }
+        if (event.key === 'ArrowUp') {
+          commitNudgeSelection(0, -step)
+          return
+        }
+        if (event.key === 'ArrowDown') {
+          commitNudgeSelection(0, step)
+        }
+      }
+
+      if (event.key.toLowerCase() === 'g' && !modifier) {
+        event.preventDefault()
+        setSnapToGrid((current) => {
+          const next = !current
+          setStatus(next ? `Grid snap on (${gridSize}px)` : 'Grid snap off.')
+          return next
+        })
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [commitDeleteSelection, commitDuplicateSelection, commitNudgeSelection, commitRotateSelection, gridSize, redo, setStatus, undo])
+
+  const undoLabel = undoStack.length > 0 ? undoStack[undoStack.length - 1].description : 'Undo'
+  const redoLabel = redoStack.length > 0 ? redoStack[redoStack.length - 1].description : 'Redo'
 
   return (
     <main className="app-shell">
       <header className="app-header">
-        <input
-          className="project-title"
-          value={projectTitle}
-          onChange={(event) => setProjectTitle(event.target.value)}
-          aria-label="Project title"
-        />
-        <nav className="tabs" aria-label="Project sections">
-          {(['plan', 'preview', 'tour', 'share'] as TabId[]).map((tabId) => (
-            <button
-              type="button"
-              key={tabId}
-              onClick={() => setActiveTab(tabId)}
-              data-active={activeTab === tabId}
-            >
-              {tabId === 'plan' && 'Phase 1 Plan'}
-              {tabId === 'preview' && 'Phase 3 Preview'}
-              {tabId === 'tour' && 'Phase 4 Tour'}
-              {tabId === 'share' && 'Phase 5 Share'}
+        <div className="header-main-row">
+          <input
+            className="project-title"
+            value={projectTitle}
+            onChange={(event) => setProjectTitle(event.target.value)}
+            aria-label="Project title"
+          />
+          <nav className="tabs" aria-label="Project sections">
+            {(['plan', 'preview', 'tour', 'share'] as TabId[]).map((tabId) => (
+              <button
+                type="button"
+                key={tabId}
+                onClick={() => setTabWithReadinessCheck(tabId)}
+                data-active={activeTab === tabId}
+              >
+                {tabId === 'plan' && 'Plan'}
+                {tabId === 'preview' && '3D Preview'}
+                {tabId === 'tour' && 'Tour'}
+                {tabId === 'share' && 'Share'}
+              </button>
+            ))}
+          </nav>
+          <div className="history-controls" aria-label="History controls">
+            <button type="button" onClick={undo} disabled={undoStack.length === 0}>
+              Undo ({undoLabel})
             </button>
-          ))}
-        </nav>
+            <button type="button" onClick={redo} disabled={redoStack.length === 0}>
+              Redo ({redoLabel})
+            </button>
+          </div>
+        </div>
+        <p className="shortcut-hint">
+          Shortcuts: Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z, Cmd/Ctrl+D, Delete, Alt+←/→ rotate, ←↑→↓ nudge (Shift = 10)
+        </p>
       </header>
 
       {activeTab === 'plan' && (
         <section className="layout">
           <aside className="panel">
-            <h1>2D Plan Editor</h1>
-            <p className="lede">
-              Phase 1 + Phase 2: parcel draw/edit, calibration, placement constraints, and asset
-              library.
-            </p>
+            <h1>2D Plan Workspace</h1>
+            <p className="lede">Draw, calibrate, place, rotate, and manage assets with full undo history.</p>
+
             <section className="control-group">
-              <h2>Mode</h2>
+              <h2>Tools</h2>
               <div className="button-row">
                 <button type="button" onClick={() => setMode('draw-parcel')} data-active={mode === 'draw-parcel'}>
                   Draw Parcel
@@ -415,13 +1020,40 @@ function App() {
                   Place Asset
                 </button>
                 <button type="button" onClick={() => setMode('move-asset')} data-active={mode === 'move-asset'}>
-                  Move Asset
+                  Move/Select
                 </button>
+              </div>
+              <div className="snap-controls">
+                <label className="checkbox-label" htmlFor="snap-to-grid-toggle">
+                  <input
+                    id="snap-to-grid-toggle"
+                    type="checkbox"
+                    checked={snapToGrid}
+                    onChange={(event) => setSnapToGrid(event.target.checked)}
+                  />
+                  Snap to grid
+                </label>
+                <label htmlFor="grid-size">Grid (canvas units)</label>
+                <input
+                  id="grid-size"
+                  type="number"
+                  min="4"
+                  max="64"
+                  step="2"
+                  value={gridSize}
+                  onChange={(event) => {
+                    const next = Number(event.target.value)
+                    if (Number.isNaN(next)) {
+                      return
+                    }
+                    setGridSize(Math.max(4, Math.min(64, next)))
+                  }}
+                />
               </div>
             </section>
 
             <section className="control-group">
-              <h2>Scale calibration</h2>
+              <h2>Scale</h2>
               <p>Current scale: 1 world unit = {formatFeet(feetPerUnit)}</p>
               <label htmlFor="real-world-feet">Calibration line length (ft)</label>
               <input
@@ -432,13 +1064,18 @@ function App() {
                 value={calibrationFeetInput}
                 onChange={(event) => setCalibrationFeetInput(event.target.value)}
               />
-              <button type="button" onClick={onApplyCalibration}>
-                Apply Calibration
-              </button>
+              <div className="button-row">
+                <button type="button" onClick={onApplyCalibration}>
+                  Apply Calibration
+                </button>
+                <button type="button" onClick={onResetCalibration}>
+                  Reset Calibration
+                </button>
+              </div>
             </section>
 
             <section className="control-group">
-              <h2>Asset library (Phase 2)</h2>
+              <h2>Asset Library</h2>
               <label htmlFor="asset-type">Asset type</label>
               <select
                 id="asset-type"
@@ -452,12 +1089,73 @@ function App() {
                 ))}
               </select>
               <p>{assets.length} assets placed</p>
+              <p>{selectedAssetIds.length} selected</p>
+            </section>
+
+            <section className="control-group">
+              <h2>Selection Actions</h2>
+              <div className="button-row">
+                <button type="button" onClick={() => commitRotateSelection(-15)}>
+                  Rotate -15°
+                </button>
+                <button type="button" onClick={() => commitRotateSelection(15)}>
+                  Rotate +15°
+                </button>
+                <button type="button" onClick={() => commitRotateSelection(-1, true)}>
+                  Fine -1°
+                </button>
+                <button type="button" onClick={() => commitRotateSelection(1, true)}>
+                  Fine +1°
+                </button>
+                <button type="button" onClick={commitDuplicateSelection}>
+                  Duplicate
+                </button>
+                <button type="button" onClick={commitDeleteSelection}>
+                  Delete
+                </button>
+              </div>
+            </section>
+
+            <section className="control-group">
+              <h2>Readiness</h2>
+              {conflicts.length === 0 ? (
+                <p className="status-ok">Ready for preview/export.</p>
+              ) : (
+                <>
+                  <p className="status-warning">{conflicts.length} conflict(s) to resolve.</p>
+                  <ul className="conflict-list">
+                    {conflicts.slice(0, 6).map((conflict) => (
+                      <li key={conflict.id} className="conflict-item">
+                        <span>{conflict.message}</span>
+                        <button type="button" onClick={() => onFocusConflict(conflict)}>
+                          Select
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
             </section>
 
             <p className="status">{status}</p>
           </aside>
 
           <section className="canvas-wrap">
+            <div className="canvas-toolbar" aria-label="Canvas actions">
+              <button type="button" onClick={undo} disabled={undoStack.length === 0}>
+                Undo
+              </button>
+              <button type="button" onClick={redo} disabled={redoStack.length === 0}>
+                Redo
+              </button>
+              <button type="button" onClick={commitDuplicateSelection}>
+                Duplicate
+              </button>
+              <button type="button" onClick={commitDeleteSelection}>
+                Delete
+              </button>
+            </div>
+
             <svg
               className="editor-canvas"
               role="img"
@@ -476,6 +1174,7 @@ function App() {
                   points={parcelPoints.map((point) => `${point.x},${point.y}`).join(' ')}
                 />
               )}
+
               {parcelClosed && (
                 <polygon
                   className="parcel-fill"
@@ -494,19 +1193,21 @@ function App() {
 
               {assets.map((asset) => {
                 const corners = getAssetCorners(asset)
-                const assetType = ASSET_TYPES.find((item) => item.id === asset.typeId) ?? ASSET_TYPES[0]
+                const assetType = getAssetType(asset.typeId)
+                const selected = selectedAssetSet.has(asset.id)
+                const handleOffset = asset.height / 2 + 24
+                const angleRad = (asset.rotationDeg * Math.PI) / 180
+                const handlePosition = {
+                  x: asset.x + handleOffset * Math.sin(angleRad),
+                  y: asset.y - handleOffset * Math.cos(angleRad),
+                }
                 return (
                   <g key={asset.id}>
                     <polygon
                       className="asset-shape"
+                      data-selected={selected}
                       points={corners.map((corner) => `${corner.x},${corner.y}`).join(' ')}
                       fill={assetType.color}
-                      onPointerDown={(event) => {
-                        if (mode === 'move-asset') {
-                          event.stopPropagation()
-                          setDraggingAssetId(asset.id)
-                        }
-                      }}
                     />
                     <text x={asset.x} y={asset.y - 6} className="asset-label">
                       {assetType.name}
@@ -514,24 +1215,30 @@ function App() {
                     <text x={asset.x} y={asset.y + 10} className="asset-measure">
                       {formatFeet(asset.width * feetPerUnit)} x {formatFeet(asset.height * feetPerUnit)}
                     </text>
+                    {selected && (
+                      <>
+                        <line
+                          className="rotate-handle-link"
+                          x1={asset.x}
+                          y1={asset.y}
+                          x2={handlePosition.x}
+                          y2={handlePosition.y}
+                        />
+                        <circle
+                          className="rotate-handle"
+                          cx={handlePosition.x}
+                          cy={handlePosition.y}
+                          r={8}
+                          onPointerDown={(event) => onRotateHandlePointerDown(event, asset)}
+                        />
+                      </>
+                    )}
                   </g>
                 )
               })}
 
               {parcelPoints.map((point, index) => (
-                <circle
-                  key={`${point.x}-${point.y}-${index}`}
-                  className="vertex"
-                  cx={point.x}
-                  cy={point.y}
-                  r={5}
-                  onPointerDown={(event) => {
-                    if (mode === 'edit-parcel') {
-                      event.stopPropagation()
-                      setDraggingVertexIndex(index)
-                    }
-                  }}
-                />
+                <circle key={`${point.x}-${point.y}-${index}`} className="vertex" cx={point.x} cy={point.y} r={5} />
               ))}
 
               {calibrationDraft.length > 0 && (
@@ -551,28 +1258,24 @@ function App() {
                   )}
                 </g>
               )}
-            </svg>
 
-            <div className="asset-actions">
-              {assets.map((asset) => (
-                <div key={asset.id} className="asset-action-row">
-                  <span>{ASSET_TYPES.find((assetType) => assetType.id === asset.typeId)?.name}</span>
-                  <button type="button" onClick={() => onRotateAsset(asset.id, -15)}>
-                    Rotate -15°
-                  </button>
-                  <button type="button" onClick={() => onRotateAsset(asset.id, 15)}>
-                    Rotate +15°
-                  </button>
-                </div>
-              ))}
-            </div>
+              {marqueeRect && mode === 'move-asset' && (
+                <rect
+                  className="marquee-selection"
+                  x={marqueeRect.minX}
+                  y={marqueeRect.minY}
+                  width={marqueeRect.maxX - marqueeRect.minX}
+                  height={marqueeRect.maxY - marqueeRect.minY}
+                />
+              )}
+            </svg>
           </section>
         </section>
       )}
 
       {activeTab === 'preview' && (
         <section className="phase-panel">
-          <h2>3D Preview (Phase 3)</h2>
+          <h2>3D Preview</h2>
           <p>Babylon.js scene mirrors parcel and placed assets from the 2D plan.</p>
           <label htmlFor="environment">Environment preset</label>
           <select
@@ -594,7 +1297,7 @@ function App() {
 
       {activeTab === 'tour' && (
         <section className="phase-panel">
-          <h2>Tour authoring (Phase 4)</h2>
+          <h2>Tour Authoring</h2>
           <p>Create stops and play them back in the 3D Preview tab.</p>
           <div className="button-row">
             <button type="button" onClick={onCreateTourStop}>
@@ -619,8 +1322,8 @@ function App() {
                 <button
                   type="button"
                   onClick={() =>
-                    setTourStops((previous) =>
-                      previous
+                    setTourStops(
+                      tourStops
                         .filter((candidate) => candidate.id !== stop.id)
                         .map((candidate, index) => ({ ...candidate, orderIndex: index })),
                     )
@@ -636,8 +1339,8 @@ function App() {
 
       {activeTab === 'share' && (
         <section className="phase-panel">
-          <h2>Sharing (Phase 5)</h2>
-          <p>Export/import project JSON today. Tokenized sharing is stubbed with a local token.</p>
+          <h2>Share</h2>
+          <p>Export/import project JSON locally. Preview/export is blocked while conflicts remain.</p>
           <div className="button-row">
             <button type="button" onClick={onExportProject}>
               Export project.json
