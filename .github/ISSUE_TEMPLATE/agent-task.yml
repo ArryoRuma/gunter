@@ -1,0 +1,40 @@
+name: Agent Task
+description: Assign a scoped task to Copilot or another coding agent
+title: "[Agent Task]: "
+labels: ["agent-task"]
+body:
+  - type: textarea
+    id: task
+    attributes:
+      label: Task
+      description: What should the agent do?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Relevant files, links, decisions, and constraints.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      value: |
+        - [ ]
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: guardrails
+    attributes:
+      label: Guardrails
+      value: |
+        - Do not rewrite unrelated files.
+        - Do not introduce dependencies unless necessary.
+        - Keep the diff focused.
+        - Update tests and docs where relevant.
+    validations:
+      required: true

@@ -1,0 +1,28 @@
+name: Refactor
+description: Plan a refactor
+title: "[Refactor]: "
+labels: ["refactor"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Refactor goal
+      description: What should improve without changing behavior?
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: What public APIs or behavior must stay the same?
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      value: |
+        - [ ] Existing tests still pass
+        - [ ] pnpm lint
+        - [ ] pnpm typecheck
+        - [ ] pnpm build
